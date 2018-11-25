@@ -1,0 +1,407 @@
+# coding=utf-8
+# ------------------------------------------------------------------------------------------------------
+# TDA596 - Lab 1
+# server/server.py
+# Input: Node_ID total_number_of_ID
+# Student: John Doe
+# ------------------------------------------------------------------------------------------------------
+import traceback
+import sys
+import time
+import json
+import random
+import argparse
+from threading import Thread
+import random
+
+from bottle import Bottle, run, request, template, response
+import requests
+# ------------------------------------------------------------------------------------------------------
+try:
+    app = Bottle()
+
+    board = {}
+
+    current_sequence_number = 0
+
+    leader_id = None
+    self_id = None
+    leader_ip = None
+
+    def is_leader():
+        global leader_id, self_id
+        return leader_id == self_id
+
+    def get_leader_ip():
+        global leader_ip
+        return leader_ip
+
+
+    # Leader is temporarily hard-coded
+    def is_leader():
+        global node_id
+        return node_id == 7
+
+    def leader_ip():
+        return "10.1.0.7"
+
+    # ------------------------------------------------------------------------------------------------------
+    # BOARD FUNCTIONS
+    # Should nopt be given to the student
+    # ------------------------------------------------------------------------------------------------------
+    def add_new_element_to_store(entry_sequence, element, is_propagated_call=False):
+        global board, node_id
+        success = False
+        try:
+            board[entry_sequence] = element
+            success = True
+        except Exception as e:
+            print e
+        return success
+
+    def modify_element_in_store(entry_sequence, modified_element, is_propagated_call=False):
+        global board, node_id
+        success = False
+        try:
+            board[entry_sequence] = modified_element
+            success = True
+        except Exception as e:
+            print e
+        return success
+
+    def delete_element_from_store(entry_sequence, is_propagated_call=False):
+        global board, node_id
+        success = False
+        try:
+            # Delete the entry only if it's already there
+            if entry_sequence in board:
+                del board[entry_sequence]
+            success = True
+        except Exception as e:
+            print e
+        return success
+
+    # ------------------------------------------------------------------------------------------------------
+    # DISTRIBUTED COMMUNICATIONS FUNCTIONS
+    # should be given to the students?
+    # ------------------------------------------------------------------------------------------------------
+    def contact_vessel(vessel_ip, path, payload=None, req='POST'):
+        # Try to contact another server (vessel) through a POST or GET, once
+        success = False
+        try:
+            if 'POST' in req:
+                res = requests.post('http://{}{}'.format(vessel_ip, path), data=payload)
+            elif 'GET' in req:
+                res = requests.get('http://{}{}'.format(vessel_ip, path))
+            else:
+                print 'Non implemented feature!'
+            # result is in res.text or res.json()
+            print(res.text)
+            if res.status_code == 200:
+                success = True
+        except Exception as e:
+            print e
+        return success
+
+    def propagate_to_vessels(path, payload=None, req='POST'):
+        global vessel_list, node_id
+
+        for vessel_id, vessel_ip in vessel_list.items():
+            if int(vessel_id) != node_id:  # don't propagate to yourself
+                success = contact_vessel(vessel_ip, path, payload, req)
+                if not success:
+                    print "\n\nCould not contact vessel {}\n\n".format(vessel_id)
+
+    # ------------------------------------------------------------------------------------------------------
+    # ROUTES
+    # ------------------------------------------------------------------------------------------------------
+    # a single example (index) should be done for get, and one for post
+    # ------------------------------------------------------------------------------------------------------
+    @app.route('/')
+    def index():
+        global board, node_id
+        return template('server/index.tpl', board_title='Vessel {}'.format(node_id), \
+            board_dict=sorted(board.iteritems()), \
+            members_name_string='Oskar Lundström and Kou Chibin', \
+            leader_id=str(leader_id))
+
+    @app.get('/board')
+    def get_board():
+        global board, node_id
+        print board
+        return template('server/boardcontents_template.tpl', board_title='Vessel {}'.format(node_id), board_dict=sorted(board.iteritems()))
+    # ------------------------------------------------------------------------------------------------------
+
+    @app.post('/board')
+    def client_add_received():
+        '''Adds a new element to the board
+        Called directly when a user is doing a POST request on /board'''
+        global board, node_id, current_sequence_number
+        try:
+            # Get the new entry and prepare payload for propagation
+            new_entry = request.forms.get('entry')
+            payload = {'entry':new_entry}
+
+            if is_leader():
+                # Only the leader adds the element directly to its store
+                add_new_element_to_store(current_sequence_number, new_entry)
+                # Then it propagates it to all other vessels
+                propagate_to_vessels_bg('/prop_to_non_leader/add/'+str(current_sequence_number), payload)
+                current_sequence_number += 1
+            else:
+                # Notify the leader that we got a new entry
+                # The element id is -1, since it should not be used
+                contact_leader_bg('/prop_to_leader/add/-1', payload)
+
+            return True
+        except Exception as e:
+            print e
+        return False
+
+    @app.post('/board/<element_id:int>/')
+    def client_action_received(element_id):
+        global board
+        action = int(request.forms.get('delete'))
+        try:
+            # Just as for the add, only the leader should do the actual
+            # operation directly on its board variable
+            if is_leader():
+                # Modify entry and propagate
+                if action == 0:
+                    new_entry = request.forms.get('entry')
+                    modify_element_in_store(element_id, new_entry)
+                    payload = {'entry':new_entry}
+                    # Propagate the modification to the other vessels
+                    propagate_to_vessels_bg('/prop_to_non_leader/modify/' + str(element_id), payload)
+                # Delete entry and propagate
+                elif action == 1:
+                    delete_element_from_store(element_id)
+                    # Propagate the deletion to the other vessels
+                    propagate_to_vessels_bg('/prop_to_non_leader/delete/' + str(element_id))
+                else:
+                    print 'UNSUPPORTED ACTION!!!'
+
+            # Non-leader
+            else:
+                # Modify
+                if action == 0:
+                    new_entry = request.forms.get('entry')
+                    payload = {'entry':new_entry}
+                    # Tell the leader we got a modification
+                    contact_leader_bg('/prop_to_leader/modify/' + str(element_id), payload)
+                # Delete
+                elif action == 1:
+                    # Tell the leader we got a deletion
+                    contact_leader_bg('/prop_to_leader/delete/' + str(element_id))
+                else:
+                    print "UNSUPPORTED ACTION!!!"
+
+            return True
+        except Exception as e:
+            print e
+        return False
+
+
+    # Helper functions for background contact
+    #-------------------------------------------------------------------
+
+    # Same as without _bg, but does it on a background thread
+    def propagate_to_vessels_bg(path, payload=None, req='POST'):
+        thread = Thread(target=propagate_to_vessels, args=(path, payload, req))
+        thread.daemon = True
+        thread.start()
+
+    # Contacts the leader in the background
+    def contact_leader_bg(path, payload=None, req='POST'):
+        thread = Thread(target=contact_vessel, args=(leader_ip(), path, payload, req))
+        thread.daemon = True
+        thread.start()
+
+
+    # Propagations to leader and non-leader
+    #---------------------------------------------------------------
+
+    # A post, which a non-leader sends to the leader whenever
+    # an add/modify/delete happens. The leader will then
+    # adjust its store, and then notify the non-leaders
+    # what happened
+    # Note: we assume this function won't be run concurrently
+    # since the web server is single-threaded
+    @app.post('/prop_to_leader/<action>/<element_id:int>')
+    def prop_to_leader_received(action, element_id):
+        global current_sequence_number
+        if not is_leader():
+            print "Warning, non-leader received propagation intended for leader only."
+            return False
+
+        try:
+            entry = request.forms.get('entry')
+            payload = {'entry':entry}
+            if action == 'add':
+                # The leader adds the new entry that it got from a non-leader
+                add_new_element_to_store(current_sequence_number, entry)
+                # The propagation to non-leaders
+                propagate_to_vessels_bg('/prop_to_non_leader/add/' + str(current_sequence_number), payload)
+                current_sequence_number += 1
+                return True
+            elif action == 'modify':
+                modify_element_in_store(element_id, entry)
+                # The propagation to non-leaders
+                propagate_to_vessels_bg('/prop_to_non_leader/modify/' + str(element_id), payload)
+                return True
+            elif action == 'delete':
+                delete_element_from_store(element_id)
+                # The propagation to non-leaders
+                propagate_to_vessels_bg('/prop_to_non_leader/delete/' + str(element_id))
+                return True
+            else:
+                print "Unsupported action!"
+                return False
+        except e:
+            print e
+            return False
+        # Note: If the same entry (number) is modified concurrently at
+        # different vessels, the last the leader notices is the
+        # one that "counts". Not ideal, but at least consistent.
+        # A similar behavior happens for a deletion/modifiction combo.
+
+
+    # The POST that non-leaders get when the leader has modified
+    # its store. Now the non-leaders do the actual modification
+    # of their stores.
+    @app.post('/prop_to_non_leader/<action>/<element_id:int>')
+    def prop_to_non_leader_received(action, element_id):
+        try:
+            if is_leader():
+                print "Warning, leader got propagation intended for non-leaders only"
+                return False
+
+            entry = request.forms.get('entry')
+            if action == 'add':
+                add_new_element_to_store(element_id, entry)
+                return True
+            elif action == 'modify':
+                modify_element_in_store(element_id, entry)
+                return True
+            elif action == 'delete':
+                delete_element_from_store(element_id)
+                return True
+            else:
+                print "Unsupported action!"
+                return False
+        except e:
+            print e
+            return False
+
+<<<<<<< HEAD
+    # Leader election
+    #--------------------------------------------------------
+
+=======
+>>>>>>> lab2_task1
+    @app.post('/leader/<action>')
+    def leader(action):
+        # A list of ids is distributed
+        global node_id, leader_id, self_id, id_list, n_nodes
+        # If we already have a leader, we ignore other leader election reqeust
+        #if leader_id is not None:
+        #    return True
+        if leader_id is not None:
+            print "leader_id: ***" + str(leader_id)
+            # If I am the leader, broadcast my 
+            return True
+        print "get request: " + request.forms.get('id_list')
+        if action == 'id_list':
+            id_list = request.forms.get('id_list')
+            print 'id_list: ' + id_list
+            id_list = id_list.split(',')
+            id_list = [int(x) for x in id_list]
+            if self_id in id_list:
+                # The message travels for a entire round, a leader can be elected now.
+                leader_id = max(id_list)
+                send_to_next('leader_id', {'leader_id': leader_id})
+            else:
+                # Append self to the id_list and pass to next
+                id_list.append(self_id)
+                id_list = [str(x) for x in id_list]
+                payload = {'id_list': ','.join(id_list)}
+                print payload
+                send_to_next('id_list', payload)
+            return True
+        elif action == 'leader_id':
+            leader_id = int(request.forms.get('ledaer_id'))
+            send_to_next('leader_id', {'leader_id': leader_id})
+            return True
+        else:
+            return False
+
+    def send_to_next(action, payload):
+        global node_id, n_nodes
+        next_id = node_id + 1
+        if node_id == (n_nodes - 1):
+            next_id = 1
+<<<<<<< HEAD
+        path = '/leader/id_list'
+        requests.post('http://10.1.0.{}{}'.format(str(next_id), path), data=payload)
+    
+    def leader_election(self_id, n_nodes):
+        global leader_id, id_list, node_id
+        time.sleep(3)
+        send_to_next({'id_list': '123'}, n_nodes)
+        while True:
+            time.sleep(100)
+=======
+        path = '/leader/' + action
+        print 'posting to :' + 'http://10.1.0.{}{}'.format(str(next_id), path)
+        url = 'http://10.1.0.{}{}'.format(str(next_id), path)
+        t = Thread(target=requests.post, args=(url, payload))
+        try:
+            t.start()
+            #requests.post('http://10.1.0.{}{}'.format(str(next_id), path), data=payload)
+        except:
+            print "error when sending post request."
+            
+    def leader_election(self_id):
+        global leader_id, id_list, node_id, n_nodes
+        time.sleep(2)
+        send_to_next('id_list', {'id_list': self_id})
+>>>>>>> lab2_task1
+
+    # ------------------------------------------------------------------------------------------------------
+    # EXECUTION
+    # ------------------------------------------------------------------------------------------------------
+    # a single example (index) should be done for get, and one for postGive it to the students-----------------------------------------------------------------------------------------------------
+    # Execute the code
+
+    def main():
+        global vessel_list, node_id, app, self_id, n_nodes
+
+        port = 80
+        parser = argparse.ArgumentParser(description='Your own implementation of the distributed blackboard')
+        parser.add_argument('--id', nargs='?', dest='nid', default=1, type=int, help='This server ID')
+        parser.add_argument('--vessels', nargs='?', dest='nbv', default=1, type=int, help='The total number of vessels present in the system')
+        args = parser.parse_args()
+        node_id = args.nid
+        vessel_list = dict()
+        # We need to write the other vessels IP, based on the knowledge of their number
+        for i in range(1, args.nbv):
+            vessel_list[str(i)] = '10.1.0.{}'.format(str(i))
+
+        n_nodes = args.nbv
+
+        self_id = random.randint(1, 2000)
+        t = Thread(target=leader_election, args=(self_id,))
+        t.daemon = True
+        #t.start()
+        
+        try:
+            run(app, host=vessel_list[str(node_id)], port=port)
+        except Exception as e:
+            print e
+    # ------------------------------------------------------------------------------------------------------
+    if __name__ == '__main__':
+        main()
+except Exception as e:
+        traceback.print_exc()
+        while True:
+            time.sleep(60.)
